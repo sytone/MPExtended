@@ -145,47 +145,74 @@ namespace MPExtended.Applications.WebMediaPortal.Controllers
             return Configuration.StreamingPlatforms.GetDefaultProfileForUserAgent(profileType, Request.UserAgent);
         }
 
-        //
-        // Streaming
-        [ServiceAuthorize]
-        public ActionResult Download(WebMediaType type, string item)
+        public ActionResult Download(WebMediaType type, string item, string token)
         {
-            // Create URL to GetMediaItem
-            Log.Debug("User wants to download type={0}; item={1}", type, item);
-            var queryString = HttpUtility.ParseQueryString(String.Empty); // you can't instantiate that class manually for some reason
-            queryString["clientDescription"] = String.Format("WebMediaPortal download (user {0})", HttpContext.User.Identity.Name);
-            queryString["type"] = ((int)type).ToString();
-            queryString["itemId"] = item;
-            string address = type == WebMediaType.TV || type == WebMediaType.Recording ? Connections.Current.Addresses.TAS : Connections.Current.Addresses.MAS;
-            string fullUrl = String.Format("http://{0}/MPExtended/StreamingService/stream/GetMediaItem?{1}", address, queryString.ToString());
-            UriBuilder fullUri = new UriBuilder(fullUrl);
+            bool downloadAllowed = false;
 
-            // If we can access the file without any problems, let IIS stream it; that is a lot faster
-            if (NetworkInformation.IsLocalAddress(fullUri.Host, false) && type != WebMediaType.TV)
+            if (HttpContext.User != null && HttpContext.User.Identity.IsAuthenticated)
             {
-                var path = type == WebMediaType.Recording ?
-                    Connections.Current.TAS.GetRecordingFileInfo(Int32.Parse(item)).Path :
-                    Connections.Current.MAS.GetMediaItem(GetProvider(type), type, item).Path[0];
-                if (System.IO.File.Exists(path))
-                    return File(path, MIME.GetFromFilename(path, "application/octet-stream"), Path.GetFileName(path));
+                Log.Debug("User wants to download type={0}; item={1}", type, item);
+                downloadAllowed = true;
             }
-
-            // If we connect to the services at localhost, actually give the extern IP address to users
-            if (NetworkInformation.IsLocalAddress(fullUri.Host, false))
-                fullUri.Host = NetworkInformation.GetIPAddress(false);
-
-            // Do the actual streaming
-            if (GetStreamMode() == StreamType.Proxied)
+            else 
             {
-                Log.Debug("Proxying download at {0}", fullUri.ToString());
-                GetStreamControl(type).AuthorizeStreaming();
-                ProxyStream(fullUri.ToString());
+                if (token != null)
+                {
+                    if(token.Equals(WebMediaPortalApplication.HashCode))
+                    {
+                        downloadAllowed = true;
+                    }
+                    else
+                    {
+                        Log.Warn("Wrong token given, download not allowed");
+                    }
+                }
+                else{
+                    Log.Warn("No token given for unauthenticated download");
+                }
             }
-            else if (GetStreamMode() == StreamType.Direct)
+            
+            if (downloadAllowed)
             {
-                Log.Debug("Redirecting user to download at {0}", fullUri.ToString());
-                GetStreamControl(type).AuthorizeRemoteHostForStreaming(HttpContext.Request.UserHostAddress);
-                return Redirect(fullUri.ToString());
+                var queryString = HttpUtility.ParseQueryString(String.Empty); // you can't instantiate that class manually for some reason
+                queryString["clientDescription"] = String.Format("WebMediaPortal download (user {0})", HttpContext.User.Identity.Name);
+                queryString["type"] = ((int)type).ToString();
+                queryString["itemId"] = item;
+                string address = type == WebMediaType.TV || type == WebMediaType.Recording ? Connections.Current.Addresses.TAS : Connections.Current.Addresses.MAS;
+                string fullUrl = String.Format("http://{0}/MPExtended/StreamingService/stream/GetMediaItem?{1}", address, queryString.ToString());
+                UriBuilder fullUri = new UriBuilder(fullUrl);
+
+                // If we can access the file without any problems, let IIS stream it; that is a lot faster
+                if (NetworkInformation.IsLocalAddress(fullUri.Host, false) && type != WebMediaType.TV)
+                {
+                    var path = type == WebMediaType.Recording ?
+                        Connections.Current.TAS.GetRecordingFileInfo(Int32.Parse(item)).Path :
+                        Connections.Current.MAS.GetMediaItem(GetProvider(type), type, item).Path[0];
+                    if (System.IO.File.Exists(path))
+                        return File(path, MIME.GetFromFilename(path, "application/octet-stream"), Path.GetFileName(path));
+                }
+
+                // If we connect to the services at localhost, actually give the extern IP address to users
+                if (NetworkInformation.IsLocalAddress(fullUri.Host, false))
+                    fullUri.Host = NetworkInformation.GetIPAddress(false);
+
+                // Do the actual streaming
+                if (GetStreamMode() == StreamType.Proxied)
+                {
+                    Log.Debug("Proxying download at {0}", fullUri.ToString());
+                    GetStreamControl(type).AuthorizeStreaming();
+                    ProxyStream(fullUri.ToString());
+                }
+                else if (GetStreamMode() == StreamType.Direct)
+                {
+                    Log.Debug("Redirecting user to download at {0}", fullUri.ToString());
+                    GetStreamControl(type).AuthorizeRemoteHostForStreaming(HttpContext.Request.UserHostAddress);
+                    return Redirect(fullUri.ToString());
+                }
+            }
+            else
+            {
+                Log.Warn("Download not authorized");
             }
             return new EmptyResult();
         }

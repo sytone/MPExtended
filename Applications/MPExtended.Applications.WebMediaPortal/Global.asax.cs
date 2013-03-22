@@ -35,6 +35,8 @@ namespace MPExtended.Applications.WebMediaPortal
 
     public class WebMediaPortalApplication : HttpApplication
     {
+        public static String HashCode;
+
         public static string GetInstallationDirectory()
         {
             // this should match with the path specified in the IIS Express config (see IISExpressHost.cs)
@@ -62,6 +64,8 @@ namespace MPExtended.Applications.WebMediaPortal
             Log.Info("WebMediaPortal version {0} started with MAS {1} and TAS {2}",
                 VersionUtil.GetFullVersionString(), Settings.ActiveSettings.MASUrl, Settings.ActiveSettings.TASUrl);
             Connections.LogServiceVersions();
+
+            HashCode = Guid.NewGuid().ToString();
 
             // automatically reload changes to the configuration files, mainly so that we instantly pick up new/deleted users. 
             Configuration.EnableChangeWatching();
