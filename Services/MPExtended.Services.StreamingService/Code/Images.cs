@@ -147,6 +147,26 @@ namespace MPExtended.Services.StreamingService.Code
             return StreamPostprocessedImage(src, maxWidth, maxHeight, borders, format);
         }
 
+        public static bool CacheImage(ImageMediaSource src, int? maxWidth, int? maxHeight, string borders, string format)
+        {
+            if (!src.Exists)
+            {
+                Log.Info("Tried to request image from non-existing source {0}", src.GetDebugName());
+                return false;
+            }
+
+            if (borders != null && (!maxWidth.HasValue || !maxHeight.HasValue))
+            {
+                Log.Error("RequestImage() called with a borders value but width or height is null");
+                return false;
+            }
+
+            if (format == null)
+                format = src.Extension.Substring(1);
+
+            return ProcessAndCacheImage(src, maxWidth, maxHeight, borders, format) != null;
+        }
+
         private static Stream StreamPostprocessedImage(ImageMediaSource src, int? maxWidth, int? maxHeight, string borders, string format)
         {
             if (!src.Exists)
@@ -166,7 +186,27 @@ namespace MPExtended.Services.StreamingService.Code
             if (format == null)
                 format = src.Extension.Substring(1);
 
-            // return from cache if possible
+            Func<Stream> streamFactory = ProcessAndCacheImage(src, maxWidth, maxHeight, borders, format);
+            if (streamFactory == null)
+                return Stream.Null;
+
+            try
+            {
+                // return image to client
+                WCFUtil.AddHeader(HttpResponseHeader.CacheControl, "public, max-age=5184000, s-maxage=5184000");
+                WCFUtil.SetContentType(GetMime(format));
+                return streamFactory();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn(String.Format("Failed to post-process and stream image {0}", src.GetDebugName()), ex);
+                return Stream.Null;
+            }
+        }
+
+        private static Func<Stream> ProcessAndCacheImage(ImageMediaSource src, int? maxWidth, int? maxHeight, string borders, string format)
+        {
+            // if it's already in the cache, use that file
             string filename = String.Format("stream_{0}_{1}_{2}_{3}.{4}", src.GetUniqueIdentifier(), maxWidth, maxHeight, borders, format);
             if (cache.Contains(filename))
             {
@@ -176,48 +216,39 @@ namespace MPExtended.Services.StreamingService.Code
                 }
                 else
                 {
-                    WCFUtil.AddHeader(HttpResponseHeader.CacheControl, "public, max-age=5184000, s-maxage=5184000"); // not really sure why 2 months exactly
-                    WCFUtil.SetContentType(GetMime(Path.GetExtension(filename)));
-                    return new FileStream(cache.GetPath(filename), FileMode.Open, FileAccess.Read, FileShare.Read);
+                    return () => new FileStream(cache.GetPath(filename), FileMode.Open, FileAccess.Read, FileShare.Read);
                 }
             }
 
+            // otherwise, resize if needed and save to cache
             try
             {
                 bool hasToResize = maxWidth.HasValue || maxHeight.HasValue;
                 bool hasToRecode = format != src.Extension.Substring(1);
 
                 if (!hasToResize && !hasToRecode)
-                {
-                    WCFUtil.AddHeader(HttpResponseHeader.CacheControl, "public, max-age=5184000, s-maxage=5184000");
-                    WCFUtil.SetContentType(GetMime(src.Extension));
-                    return src.Retrieve();
-                }
+                    return () => src.Retrieve();
 
-                // save image to cache
-                string path = cache.GetPath(String.Format("stream_{0}_{1}_{2}_{3}.{4}", src.GetUniqueIdentifier(), maxWidth, maxHeight, borders, format));
+                // process and save to cache
                 using (var stream = src.Retrieve())
                 {
                     var image = hasToResize ? ResizeImage(stream, maxWidth, maxHeight, borders) : Image.FromStream(stream);
-                    SaveImageToFile(image, path, format);
+                    SaveImageToFile(image, cache.GetPath(filename), format);
                     image.Dispose();
                 }
 
-                // return image to client
-                WCFUtil.AddHeader(HttpResponseHeader.CacheControl, "public, max-age=5184000, s-maxage=5184000");
-                WCFUtil.SetContentType(GetCodecInfo(format).MimeType);
-                return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                return () => new FileStream(cache.GetPath(filename), FileMode.Open, FileAccess.Read, FileShare.Read);
             }
             catch (Exception ex)
             {
-                Log.Warn(String.Format("Failed to post-process and stream image {0}", src.GetDebugName()), ex);
-                return Stream.Null;
+                Log.Warn(String.Format("Failed to process and cache image {0}", src.GetDebugName()), ex);
+                return null;
             }
         }
 
         private static string GetMime(string extension)
         {
-            string lowerExtension = extension.Substring(1).ToLower();
+            string lowerExtension = (extension.StartsWith(".") ? extension.Substring(1) : extension).ToLower();
             Dictionary<string, string> commonMimeTypes = new Dictionary<string, string>() 
             {
                 { "jpeg", "image/jpeg" },
@@ -231,15 +262,19 @@ namespace MPExtended.Services.StreamingService.Code
 
         private static Image ResizeImage(Stream stream, int? maxWidth, int? maxHeight, string borders)
         {
-            bool doBorders = !String.IsNullOrEmpty(borders) && borders != "stretch";
-
             using (var origImage = Image.FromStream(stream))
             {
-                Resolution newSize = Resolution.Calculate(origImage.Width, origImage.Height, maxWidth, maxHeight, 1);
-                int bitmapWidth = String.IsNullOrEmpty(borders) ? newSize.Width : maxWidth.Value;
-                int bitmapHeight = String.IsNullOrEmpty(borders) ? newSize.Height : maxHeight.Value;
+                // newImageSize is the size of the actual graphic, which might not be the size of the canvas (bitmap). Unless
+                // we're instructed to stretch the image, it's a proportional resize of the source graphic. Borders will be
+                // added when we're instructed to and the aspect ratio of the image isn't equal to the aspect ratio of the 
+                // bitmap.
+                Resolution newImageSize = borders != "stretch" ? 
+                    Resolution.Calculate(origImage.Width, origImage.Height, maxWidth, maxHeight, 1) :
+                    Resolution.Create(maxWidth.Value, maxHeight.Value);
+                bool addBorders = !String.IsNullOrEmpty(borders) && borders != "stretch" && newImageSize.AspectRatio != (double)maxWidth / maxHeight;
 
-                Bitmap newImage = new Bitmap(bitmapWidth, bitmapHeight, PixelFormat.Format32bppArgb);
+                Resolution bitmapSize = addBorders ? Resolution.Create(maxWidth.Value, maxHeight.Value) : newImageSize;
+                Bitmap newImage = new Bitmap(bitmapSize.Width, bitmapSize.Height, PixelFormat.Format32bppArgb);
                 using (Graphics graphic = Graphics.FromImage(newImage))
                 {
                     graphic.InterpolationMode = InterpolationMode.HighQualityBicubic;
@@ -248,36 +283,17 @@ namespace MPExtended.Services.StreamingService.Code
                     graphic.CompositingMode = CompositingMode.SourceCopy;
                     graphic.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
-                    if (doBorders && (1.0 * maxWidth.Value / newSize.Width) != (1.0 * maxHeight.Value / newSize.Height))
-                        graphic.FillRectangle(new SolidBrush(ColorTranslator.FromHtml("#" + borders)), 0, 0, bitmapWidth, bitmapHeight);
+                    if (addBorders && borders != "transparent")
+                        graphic.FillRectangle(new SolidBrush(ColorTranslator.FromHtml("#" + borders)), 0, 0, bitmapSize.Width, bitmapSize.Height);
 
-                    int leftOffset = doBorders ? (maxWidth.Value - newSize.Width) / 2 : 0;
-                    int heightOffset = doBorders ? (maxHeight.Value - newSize.Height) / 2 : 0;
-                    graphic.DrawImage(origImage, leftOffset, heightOffset, 
-                        borders == "stretch" ? maxWidth.Value  : newSize.Width, 
-                        borders == "stretch" ? maxHeight.Value : newSize.Height);
+                    // We center the graphic in the canvas. If we should stretch the image, newImageSize is equal to the canvas, so 
+                    // the graphic is pasted at the top-left corner, which is fine.
+                    int leftOffset = (bitmapSize.Width - newImageSize.Width) / 2;
+                    int heightOffset = (bitmapSize.Height - newImageSize.Height) / 2;
+                    graphic.DrawImage(origImage, leftOffset, heightOffset, newImageSize.Width, newImageSize.Height);
                 }
 
                 return newImage;
-            }
-        }
-
-        private static ImageCodecInfo GetCodecInfo(string format)
-        {
-            switch (format.ToLower())
-            {
-                case "png":
-                    return ImageCodecInfo.GetImageEncoders().First(enc => enc.FormatID == ImageFormat.Png.Guid);
-                case "jpeg":
-                case "jpg":
-                    return ImageCodecInfo.GetImageEncoders().First(enc => enc.FormatID == ImageFormat.Jpeg.Guid);
-                case "gif":
-                    return ImageCodecInfo.GetImageEncoders().First(enc => enc.FormatID == ImageFormat.Gif.Guid);
-                case "bmp":
-                    return ImageCodecInfo.GetImageEncoders().First(enc => enc.FormatID == ImageFormat.Bmp.Guid);
-                default:
-                    Log.Warn("Requested invalid file format '{0}'", format);
-                    throw new ArgumentException(String.Format("Invalid file format '{0}'", format));
             }
         }
 
@@ -299,7 +315,7 @@ namespace MPExtended.Services.StreamingService.Code
 
                 case "jpeg":
                 case "jpg":
-                    var jpegInfo = GetCodecInfo(format);
+                    var jpegInfo = ImageCodecInfo.GetImageEncoders().First(enc => enc.FormatID == ImageFormat.Jpeg.Guid);
                     var jpegParameters = new EncoderParameters(1);
                     jpegParameters.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
                     image.Save(path, jpegInfo, jpegParameters);

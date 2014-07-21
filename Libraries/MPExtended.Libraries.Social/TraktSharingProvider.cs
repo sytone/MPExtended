@@ -21,6 +21,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using MPExtended.Libraries.Service;
+using MPExtended.Libraries.Service.Extensions;
 using MPExtended.Libraries.Social.Trakt;
 using MPExtended.Services.MediaAccessService.Interfaces;
 using MPExtended.Services.MediaAccessService.Interfaces.Movie;
@@ -30,7 +31,23 @@ namespace MPExtended.Libraries.Social
 {
     public class TraktSharingProvider : IWatchSharingService
     {
-        public Dictionary<string,string> Configuration { get; set; }
+        private Dictionary<string, string> _configuration;
+        public Dictionary<string, string> Configuration
+        {
+            get
+            {
+                return _configuration;
+            }
+
+            set
+            {
+                _configuration = value;
+                if (_configuration.ContainsKey("username"))
+                    Log.Info("Trakt: syncing to username '{0}'", _configuration["username"]);
+                if (!_configuration.ContainsKey("username") || !_configuration.ContainsKey("passwordHash"))
+                    Log.Error("Trakt: username and/or password not set in configuration");
+            }
+        }
 
         public int UpdateInterval
         {
@@ -44,7 +61,7 @@ namespace MPExtended.Libraries.Social
         {
             byte[] data = Encoding.ASCII.GetBytes(password);
             byte[] hash = SHA1Managed.Create().ComputeHash(data);
-            return BitConverter.ToString(hash).Replace("-", string.Empty).ToLower();
+            return hash.ToHexString();
         }
 
         public bool TestCredentials(string username, string password)

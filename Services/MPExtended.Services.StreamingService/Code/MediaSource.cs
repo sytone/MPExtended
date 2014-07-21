@@ -1,5 +1,6 @@
-﻿#region Copyright (C) 2011-2013 MPExtended
+﻿#region Copyright (C) 2011-2013 MPExtended, 2010 MovingPictures
 // Copyright (C) 2011-2013 MPExtended Developers, http://www.mpextended.com/
+// Copyright (C) 2010 MovingPictures, http://code.google.com/p/moving-pictures/
 // 
 // MPExtended is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,15 +20,17 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using MPExtended.Libraries.Client;
 using MPExtended.Libraries.Service;
+using MPExtended.Libraries.Service.Extensions;
 using MPExtended.Libraries.Service.Network;
+using MPExtended.Libraries.Service.Strings;
 using MPExtended.Libraries.Service.Util;
 using MPExtended.Services.Common.Interfaces;
 using MPExtended.Services.MediaAccessService.Interfaces;
 using MPExtended.Services.StreamingService.Interfaces;
-using MPExtended.Services.StreamingService.Units;
 using MPExtended.Services.TVAccessService.Interfaces;
 
 namespace MPExtended.Services.StreamingService.Code
@@ -62,14 +65,6 @@ namespace MPExtended.Services.StreamingService.Code
                 {
                     return Exists && Connections.IsMASLocal && Configuration.Services.NetworkImpersonation.ReadInStreamingService && GetFileInfo().IsLocalFile;
                 }
-            }
-        }
-
-        public virtual bool NeedsInputReaderUnit
-        {
-            get
-            {
-                return (MediaType == WebMediaType.TV && FileType == WebFileType.Content) || !SupportsDirectAccess;
             }
         }
 
@@ -119,6 +114,39 @@ namespace MPExtended.Services.StreamingService.Code
                     );
         }
 
+        /// <returns>Error if there is a problem with the MediaSource, null otherwise</returns>
+        public string CheckAvailability()
+        {
+            string path = GetPath();
+            if (path == null || path.Length == 0)
+                return UI.StreamErrorUnknownPath;
+
+            // some checks based upon the file info. apparantly people have broken files in their collection.
+            var fileinfo = GetFileInfo();
+            if (!fileinfo.Exists)
+            {
+                // add a special warning message for files that are on a network drive, as this often causes problems
+                Uri uri = new Uri(path);
+                if (uri.IsUnc && !NetworkInformation.IsLocalAddress(uri.Host))
+                    return UI.StreamErrorInaccessibleNetworkShare;
+
+                return UI.StreamErrorFileDoesntExists;
+            }
+
+            if (MediaType != WebMediaType.TV && fileinfo.Size == 0)
+                return UI.StreamErrorFileIsEmpty;
+
+            // we don't support some things yet
+            if (path.EndsWith(".IFO"))
+                return UI.StreamErrorDVDsNotSupported;
+
+            // while corrupt files may work, it's probably a better idea to warn early. check for a valid file using mediainfo
+            if (MediaInfo.MediaInfoWrapper.GetMediaInfo(this) == null)
+                return UI.StreamErrorFileIsCorrupt;
+
+            return null;
+        }
+
         public virtual WebFileInfo GetFileInfo()
         {
             if (fileInfoCache != null)
@@ -152,7 +180,12 @@ namespace MPExtended.Services.StreamingService.Code
                     IsLocalFile = true,
                     IsReadOnly = true,
                     OnNetworkDrive = false,
-                    PID = -1
+                    PID = -1,
+                    // This field should not be read for the TV mediatype, since we can't know the size of timeshiftings. However, since
+                    // there might slip a usage through and this has broken live TV streaming over WAN in the Direct profile for months
+                    // in the past, let's assume they're infinitely large for practical purposes here.
+                    // TODO: Maybe use a childclass of WebFileInfo that throws in the Size.get accessor? At least we get clear logs then.
+                    Size = Int64.MaxValue
                 };
                 fileInfoCache.Path = PathUtil.StripFileProtocolPrefix(fileInfoCache.Path);
                 return fileInfoCache;
@@ -165,19 +198,6 @@ namespace MPExtended.Services.StreamingService.Code
         public string GetPath()
         {
             return MediaType == WebMediaType.TV && FileType == WebFileType.Content ? PathUtil.StripFileProtocolPrefix(Id) : GetFileInfo().Path;
-        }
-
-        public IProcessingUnit GetInputReaderUnit()
-        {
-            if (SupportsDirectAccess)
-            {
-                // TV always has NeedsImpersonation = false and SupportsDirectAccess = true, so gets redirect to InputUnit
-                return NeedsImpersonation ? (IProcessingUnit)(new ImpersonationInputUnit(GetPath())) : (IProcessingUnit)(new InputUnit(GetPath()));
-            }
-            else
-            {
-                return new InjectStreamUnit(Retrieve());
-            }
         }
 
         public INetworkContext CreateNetworkContext()
@@ -274,6 +294,59 @@ namespace MPExtended.Services.StreamingService.Code
         public override string ToString()
         {
             return GetMediaDisplayName();
+        }
+
+        /// <summary>
+        /// Calculates a unique hash for the contents of the file, in a smart way that avoids
+        /// reading the whole file from disk. Use this method to compute hashes of large files.
+        /// 
+        /// Taken from MovingPictures source: Cornerstone/Extension/IO/FileInfoExtensions.cs.
+        /// </summary>
+        public string ComputeSmartHash()
+        {
+            try
+            {
+                using (Stream input = Retrieve())
+                {
+                    long streamsize = input.Length;
+                    ulong lhash = (ulong)streamsize;
+
+                    long i = 0;
+                    byte[] buffer = new byte[sizeof(long)];
+                    input.Position = 0;
+                    while (i < 65536 / sizeof(long) && (input.Read(buffer, 0, sizeof(long)) > 0))
+                    {
+                        i++;
+                        unchecked { lhash += BitConverter.ToUInt64(buffer, 0); }
+                    }
+
+                    input.Position = Math.Max(0, streamsize - 65536);
+                    i = 0;
+                    while (i < 65536 / sizeof(long) && (input.Read(buffer, 0, sizeof(long)) > 0))
+                    {
+                        i++;
+                        unchecked { lhash += BitConverter.ToUInt64(buffer, 0); }
+                    }
+
+                    return BitConverter.GetBytes(lhash).ToHexString();
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Warn("Error computing smart hash", e);
+                return null;
+            }
+        }
+
+        public string ComputeFullHash()
+        {
+            using (var md5 = MD5.Create())
+            {
+                using (var stream = Retrieve())
+                {
+                    return md5.ComputeHash(stream).ToHexString();
+                }
+            }
         }
     }
 }
